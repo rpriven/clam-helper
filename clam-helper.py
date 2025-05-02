@@ -7,9 +7,16 @@ import datetime
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 import argparse
-from termcolor import colored
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, *args, **kwargs): return x  # dummy passthrough
+try:
+    from termcolor import colored
+except ImportError:
+    def colored(text, *args, **kwargs): return text
 
 
 # === CONFIGURABLE ===
@@ -29,6 +36,8 @@ CLAMSCAN_PATH = shutil.which("clamscan") or "/usr/bin/clamscan"
 parser = argparse.ArgumentParser()
 parser.add_argument("-ql", "--quarantine-location", type=str, default=QUARANTINE_DIR,
                     help="Alternate path for quarantine storage.")
+parser.add_argument("--purge", action="store_true",
+                    help="Delete all files in quarantine after scanning.")
 args = parser.parse_args()
 
 quarantine_path = Path(
@@ -53,12 +62,36 @@ def log_to(file_path, line):
         f.write(line + "\n")
 
 
-def scan_directory(target_dir: Path, quarantine: Path, log_dir: Path) -> Path:
+def fast_folder_list(root: Path, max_depth=5):
+    try:
+        # Use 'fd' if available
+        out = subprocess.check_output(
+            ["fd", "--type", "d", f"--max-depth={max_depth}", ".", str(root)], text=True)
+        return [Path(p) for p in out.strip().splitlines()]
+    except Exception:
+        try:
+            # Use 'find' fallback
+            out = subprocess.check_output(
+                ["find", str(root), "-type", "d", "--maxdepth", str(max_depth)], text=True)
+            return [Path(p) for p in out.strip().splitlines()]
+        except Exception:
+            # Fallback to Python
+            folders = []
+            for dirpath, dirnames, _ in os.walk(root):
+                depth = len(Path(dirpath).relative_to(root).parts)
+                if depth <= max_depth:
+                    folders.append(Path(dirpath))
+            return folders
+
+
+def scan_directory(target_dir: Path, quarantine: Path, log_dir: Path, drive_path: Path) -> Path:
+    print("Launching scan on {target_dir}...")
     log_file = log_dir / f"scan_{target_dir.name}.log"
     crash_file = log_dir / "crash_summary.txt"
 
     command = [
         CLAMSCAN_PATH,
+        "--bell",
         "-r",
         str(target_dir),
         f"--move={QUARANTINE_DIR}",
@@ -84,7 +117,7 @@ def scan_directory(target_dir: Path, quarantine: Path, log_dir: Path) -> Path:
                 except Exception as e:
                     log(f"Subfolder scan also failed: {sub} | Reason: {e}", crash_file)
     else:
-        log(f"Max recursion depth hit. Skipping deeper folders in {target_dir}.", crash_file)
+        log(f"Max recursion depth {len(Path(target_dir).is_relative_to(drive_path).parts)} hit. Skipping deeper folders in {target_dir}.", crash_file)
 
     return log_file
 
@@ -121,6 +154,11 @@ def finalize_quarantine(quarantine_path):
             print(f"Locked file with chattr +i: {f}", "magenta")
 
     # print contents of quarantine_path
+    print("Quarantine contents:")
+    for f in quarantine_path.iterdir():
+        print(f" - {f.name}")
+
+    print(f"[!] Quarantine still contains {len(list(quarantine_path.iterdir()))} files after scan.")
 
 # ---------- MAIN SCRIPT ----------
 
@@ -141,9 +179,10 @@ def main():
     ensure_quarantine_writable(QUARANTINE_DIR)
 
     # top_dirs = [d for d in drive_path.iterdir() if d.is_dir()]
-    top_dirs = [d for d in drive_path.rglob("*") if d.is_dir()]
-    if not top_dirs:
-        top_dirs = [drive_path]  # If no subfolders, scan the root directly
+    # top_dirs = [d for d in drive_path.rglob("*") if d.is_dir()]
+    # if not top_dirs:
+    # top_dirs = [drive_path]  # If no subfolders, scan the root directly
+    top_dirs = fast_folder_list(drive_path, max_depth=5)
 
     pbar = tqdm(total=len(top_dirs), desc="Scanning folders", unit="dir")
 
@@ -168,6 +207,19 @@ def main():
             for line in f:
                 if line.strip().endswith("FOUND"):
                     total_infected += 1
+
+    if args.purge:
+        for file in QUARANTINE_DIR.glob("*"):
+            file.unlink()
+        print("[✓] Quarantine purged.")
+    else:
+        choice = input("Do you want to purge quarantine? [y/N]: ").lower().strip()
+        if choice == 'y':
+            for file in QUARANTINE_DIR.glob("*"):
+                file.unlink()
+            print("[✓] Quarantine purged.")
+        else:
+            print(f"[!] Quarantine left intact with {len(list(QUARANTINE_DIR.iterdir()))} file(s).")
 
     log(f"Scan complete. Total infected files: {total_infected}", summary_file)
     print(f"\nAll logs saved in: {scan_log_dir.resolve()}")
