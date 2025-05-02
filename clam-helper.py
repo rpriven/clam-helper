@@ -7,6 +7,10 @@ import datetime
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import argparse
+from termcolor import colored
+
 
 # === CONFIGURABLE ===
 MAX_THREADS = 4
@@ -14,12 +18,21 @@ QUARANTINE_DIR = Path.home() / ".quarantine"
 SCAN_LOG_BASE = Path.home() / ".clamscan_logs"
 CRASH_LOG = SCAN_LOG_BASE / "crash_summary.txt"
 EMPTY_LOG = SCAN_LOG_BASE / "empty_files.txt"
+INFECTED_LOG = SCAN_LOG_BASE / "infected_files.txt"
 SUMMARY_LOG = SCAN_LOG_BASE / "summary.txt"
 MAX_SCAN_SIZE_MB = 200  # Optional: set to None to omit
 MAX_FILE_SIZE_MB = 100  # Optional: set to None to omit
 CLAMSCAN_PATH = shutil.which("clamscan") or "/usr/bin/clamscan"
 
 # === HELPERS ===
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-ql", "--quarantine-location", type=str, default=QUARANTINE_DIR,
+                    help="Alternate path for quarantine storage.")
+args = parser.parse_args()
+
+quarantine_path = Path(
+    args.quarantine_location) if args.quarantine_location else QUARANTINE_DIR / ".quarantine"
 
 
 def sanitize_path(path: str) -> str:
@@ -64,6 +77,15 @@ def scan_directory(target_dir: Path, quarantine: Path, log_dir: Path) -> Path:
         log(f"Scan completed: {target_dir}", log_file)
     except subprocess.CalledProcessError:
         log(f"[!] Clamscan crashed on {target_dir}. Skipping.", crash_file)
+        for sub in target_dir.iterdir():
+            if sub.is_dir():
+                try:
+                    scan_directory(..., quarantine_path, ...)
+                except Exception as e:
+                    log(f"Subfolder scan also failed: {sub} | Reason: {e}", crash_file)
+    else:
+        log(f"Max recursion depth hit. Skipping deeper folders in {target_dir}.", crash_file)
+
     return log_file
 
     # Post-scan, log empty files
@@ -71,19 +93,34 @@ def scan_directory(target_dir: Path, quarantine: Path, log_dir: Path) -> Path:
         for line in f:
             if "Empty file" in line:
                 log_to(EMPTY_LOG, line.strip())
+            elif "FOUND" in line:
+                with open(INFECTED_LOG, "a") as infected_log:
+                    infected_log.write(f"{datetime.now().isoformat()} | {line.strip()}\n")
 
 
-def ensure_quarantine_writable(quarantine: Path):
-    if quarantine.exists():
-        for f in quarantine.iterdir():
+def ensure_quarantine_writable(quarantine_path):
+    if quarantine_path.exists():
+        for f in quarantine_path.iterdir():
             if f.is_file():
+                print(f"Removing stale file: {f}", "yellow")
                 f.unlink()
-    quarantine.mkdir(parents=True, exist_ok=True)
-    quarantine.chmod(0o755)
+    quarantine_path.mkdir(parents=True, exist_ok=True)
+    quarantine_path.chmod(0o755)
+    print(f"Quarantine ready and writable: {quarantine_path}", "green")
 
 
-def finalize_quarantine(quarantine: Path):
-    quarantine.chmod(0o700)
+def finalize_quarantine(quarantine_path):
+    quarantine_path.chmod(0o700)
+    print(f"Quarantine permissions secured: {quarantine_path}", "cyan")
+
+    # Make files immutable
+    for f in quarantine_path.iterdir():
+        if f.is_file():
+            subprocess.run(["chattr", "+i", str(f)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            print(f"Locked file with chattr +i: {f}", "magenta")
+
+    # print contents of quarantine_path
 
 # ---------- MAIN SCRIPT ----------
 
@@ -103,9 +140,12 @@ def main():
 
     ensure_quarantine_writable(QUARANTINE_DIR)
 
-    top_dirs = [d for d in drive_path.iterdir() if d.is_dir()]
+    # top_dirs = [d for d in drive_path.iterdir() if d.is_dir()]
+    top_dirs = [d for d in drive_path.rglob("*") if d.is_dir()]
     if not top_dirs:
         top_dirs = [drive_path]  # If no subfolders, scan the root directly
+
+    pbar = tqdm(total=len(top_dirs), desc="Scanning folders", unit="dir")
 
     log_files = []
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
@@ -114,6 +154,9 @@ def main():
         for future in as_completed(future_to_dir):
             log_file = future.result()
             log_files.append(log_file)
+            pbar.update(1)
+
+        pbar.close()
 
     finalize_quarantine(QUARANTINE_DIR)
 

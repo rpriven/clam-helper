@@ -32,8 +32,7 @@
 2. **Run the Script**
     
     ```bash
-    CopyEdit
-    python3 scan-helper.py
+    python3 clam-helper.py
 
 3. **Follow Prompts**:
     - Enter the full path to the mounted drive (e.g., `/media/username/My Passport`).
@@ -47,7 +46,6 @@
 ## 📁 Example Directory Structure
 
 ```
-CopyEdit
 ~/.clamscan_logs/
   └── My_Passport_2025-05-01_1835/
       ├── 01_Users.log
